@@ -1,0 +1,4 @@
+[2026-11-19T08:19:00.014Z] ❌ [email-nodemailer] Failed to deliver booking summary to guest (manojlasantha1999@gmail.com): Error: getaddrinfo ENOTFOUND mail.royalmansionresorts.com
+at GetAddrInfoReqWrap.onlookupall [as oncomplete] (node:dns:122:26)
+[2026-11-19T08:19:00.022Z] ❌ [email-nodemailer] Failed to deliver booking alert to admin (info@royalmansionresorts.com): Error: getaddrinfo ENOTFOUND mail.royalmansionresorts.com
+at GetAddrInfoReqWrap.onlookupall [as oncomplete] (node:dns:122:26)

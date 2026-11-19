@@ -18,7 +18,12 @@ function escapeHtml(str: string | null | undefined): string {
  * Log email errors to both console and persistent log files for cPanel Passenger debugging.
  */
 export function logEmailError(prefix: string, err: any) {
-  const line = `[${new Date().toISOString()}] ❌ [email-nodemailer] ${prefix}: ${err?.stack || err?.message || String(err)}\n`;
+  const errMsg = err?.stack || err?.message || String(err);
+  let hint = "";
+  if (typeof errMsg === "string" && errMsg.includes("ENOTFOUND")) {
+    hint = "\n👉 [cPanel Hint] DNS resolution failed for SMTP host. If running on cPanel, set SMTP_HOST=localhost or SMTP_HOST=127.0.0.1 in your .env to connect to local Exim without DNS lookups.";
+  }
+  const line = `[${new Date().toISOString()}] ❌ [email-nodemailer] ${prefix}: ${errMsg}${hint}\n`;
   try {
     const emailLogDir = path.resolve(process.cwd(), "logs/emails");
     if (!fs.existsSync(emailLogDir)) fs.mkdirSync(emailLogDir, { recursive: true });
@@ -113,8 +118,73 @@ export async function verifyEmailTransport(): Promise<boolean> {
     console.log("✅ [email-nodemailer] SMTP transport connection verified successfully.");
     return true;
   } catch (err) {
+    resetCachedTransporter();
     console.error("❌ [email-nodemailer] SMTP verification failed:", err);
     return false;
+  }
+}
+
+/**
+ * Send an email with automatic error handling, cache reset, and localhost (127.0.0.1)
+ * fallback on cPanel when external DNS resolution fails (ENOTFOUND).
+ */
+export async function sendMailWithFallback(
+  mailOptions: Parameters<Transporter["sendMail"]>[0]
+): Promise<any> {
+  const transporter = getEmailTransporter();
+  if (!transporter) {
+    throw new Error("SMTP transporter is not configured");
+  }
+
+  try {
+    return await transporter.sendMail(mailOptions);
+  } catch (err: any) {
+    const isDnsError =
+      err?.code === "ENOTFOUND" ||
+      err?.syscall === "getaddrinfo" ||
+      (typeof err?.message === "string" && err.message.includes("ENOTFOUND"));
+
+    // Invalidate cached transporter on any connection or DNS error
+    resetCachedTransporter();
+
+    // If DNS failed on a domain host on cPanel, fallback to local Exim mail server (127.0.0.1)
+    if (
+      isDnsError &&
+      env.SMTP_HOST &&
+      env.SMTP_HOST !== "localhost" &&
+      env.SMTP_HOST !== "127.0.0.1" &&
+      env.SMTP_USER &&
+      env.SMTP_PASS
+    ) {
+      console.warn(
+        `⚠️ [email-nodemailer] DNS resolution failed for "${env.SMTP_HOST}". Attempting automatic fallback to local cPanel mail server (127.0.0.1)...`
+      );
+      try {
+        const fallbackTransporter = nodemailer.createTransport({
+          host: "127.0.0.1",
+          port: env.SMTP_PORT || 465,
+          secure: Boolean(env.SMTP_SECURE || Number(env.SMTP_PORT) === 465),
+          auth: {
+            user: env.SMTP_USER,
+            pass: env.SMTP_PASS,
+          },
+          tls: {
+            rejectUnauthorized: false,
+          },
+          connectionTimeout: env.SMTP_TIMEOUT_MS,
+          greetingTimeout: 10000,
+          socketTimeout: env.SMTP_TIMEOUT_MS,
+        });
+
+        const fallbackResult = await fallbackTransporter.sendMail(mailOptions);
+        console.log(`✅ [email-nodemailer] Delivered email via local cPanel fallback (127.0.0.1).`);
+        return fallbackResult;
+      } catch (fallbackErr) {
+        logEmailError("Local cPanel fallback (127.0.0.1) also failed", fallbackErr);
+      }
+    }
+
+    throw err;
   }
 }
 
@@ -149,7 +219,7 @@ export async function sendEmail(options: SendMailOptions): Promise<{ sent: boole
   }
 
   try {
-    const info = await transporter.sendMail({
+    const info = await sendMailWithFallback({
       from,
       to: options.to,
       subject: options.subject,
@@ -336,7 +406,7 @@ Contact: +94 76 400 1245 | info.royalmationresort@gmail.com
     if (transporter) {
       // 1. Send confirmation to Guest
       try {
-        await transporter.sendMail({
+        await sendMailWithFallback({
           from: fromEmail,
           to: guestEmailRaw,
           subject,
@@ -358,7 +428,7 @@ Contact: +94 76 400 1245 | info.royalmationresort@gmail.com
             </div>
             ${html}
           `;
-          await transporter.sendMail({
+          await sendMailWithFallback({
             from: fromEmail,
             to: adminEmail,
             subject: `[Admin Alert - Guest: ${guestNameRaw}] ${subject}`,
@@ -467,6 +537,7 @@ export async function testSmtpConnection(targetEmail?: string): Promise<{
     await transporter.verify();
     diag.verified = true;
   } catch (verifyErr: any) {
+    resetCachedTransporter();
     const errText = verifyErr?.message || String(verifyErr);
     logEmailError("testSmtpConnection verification failed", verifyErr);
     return {
@@ -488,7 +559,7 @@ export async function testSmtpConnection(targetEmail?: string): Promise<{
 
   try {
     const from = getDefaultFromEmail();
-    const info = await transporter.sendMail({
+    const info = await sendMailWithFallback({
       from,
       to: recipient,
       subject: `[Diagnostic Test] Royal Mansion Resort Villa - ${new Date().toLocaleString()}`,

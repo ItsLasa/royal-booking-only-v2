@@ -164,7 +164,8 @@ PAYHERE_CANCEL_URL=https://yourdomain.com/booking/cancel
 # Email Notification Services (Nodemailer SMTP)
 # ------------------------------------------------------------------------------
 # OPTION A: cPanel Domain Email (RECOMMENDED for cPanel - Never blocked by CSF firewall)
-SMTP_HOST=mail.yourdomain.com
+# Use 'localhost' or '127.0.0.1' to connect directly to the local cPanel Exim mail server (bypasses DNS lookups)
+SMTP_HOST=localhost
 SMTP_PORT=465
 SMTP_SECURE=true
 SMTP_TLS_REJECT_UNAUTHORIZED=false

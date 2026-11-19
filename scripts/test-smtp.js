@@ -103,6 +103,7 @@ async function runDiagnostics() {
       console.log(`❌ FAILED`);
       console.error(`   DNS Error: ${dnsErr.message}`);
       console.error("   👉 Troubleshooting: Verify that your SMTP_HOST is spelled correctly.");
+      console.error("   👉 On cPanel: If your email is hosted on this same cPanel server, change SMTP_HOST=localhost or SMTP_HOST=127.0.0.1 in your .env to connect to local Exim mail server without DNS lookups.\n");
       process.exit(1);
     }
 
