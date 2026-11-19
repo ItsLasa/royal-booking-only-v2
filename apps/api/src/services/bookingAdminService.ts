@@ -7,6 +7,7 @@ import { createBookingReference } from "../lib/references";
 import { dateKey, nightsBetween, occupiedNights } from "../lib/dates";
 import { assertAvailable } from "./availabilityService";
 import { calculateQuote, QuoteInput, quoteSchema } from "./pricingService";
+import { sendBookingSummaryEmail } from "./emailService";
 
 export type BookingListQuery = {
   page?: number;
@@ -211,6 +212,12 @@ export async function confirmBooking(prisma: PrismaClient, actor: AdminActor, id
 
   const updated = await prisma.booking.update({ where: { id }, data: { bookingStatus: "CONFIRMED", confirmedAt: new Date(), expiresAt: null }, include: bookingInclude });
   await writeAudit(prisma, actor, "BOOKING_CONFIRMED", "Booking", updated.reference, { bookingStatus: booking.bookingStatus }, { bookingStatus: "CONFIRMED" }, meta);
+
+  // Automatically dispatch booking confirmation email to guest and admin notification
+  sendBookingSummaryEmail(prisma, updated.id).catch((emailErr) => {
+    console.warn("⚠️ Failed to send booking confirmation email upon admin confirmation:", emailErr);
+  });
+
   return updated;
 }
 

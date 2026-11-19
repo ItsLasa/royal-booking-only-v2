@@ -160,6 +160,29 @@ PAYHERE_MERCHANT_SECRET=
 PAYHERE_NOTIFY_URL=https://yourdomain.com/api/v1/payments/payhere/notify
 PAYHERE_RETURN_URL=https://yourdomain.com/booking/success
 PAYHERE_CANCEL_URL=https://yourdomain.com/booking/cancel
+
+# Email Notification Services (Nodemailer SMTP)
+# ------------------------------------------------------------------------------
+# OPTION A: cPanel Domain Email (RECOMMENDED for cPanel - Never blocked by CSF firewall)
+SMTP_HOST=mail.yourdomain.com
+SMTP_PORT=465
+SMTP_SECURE=true
+SMTP_TLS_REJECT_UNAUTHORIZED=false
+SMTP_USER=reservations@yourdomain.com
+SMTP_PASS=YourEmailPasswordHere
+EMAIL_FROM="Royal Mansion Resort <reservations@yourdomain.com>"
+ADMIN_NOTIFICATION_EMAIL=owner@yourdomain.com
+
+# OPTION B: Gmail SMTP (Note: Port 587 may be blocked by some cPanel host firewalls)
+# SMTP_SERVICE=gmail
+# SMTP_HOST=smtp.gmail.com
+# SMTP_PORT=587
+# SMTP_SECURE=false
+# SMTP_TLS_REJECT_UNAUTHORIZED=false
+# SMTP_USER=yourgmail@gmail.com
+# SMTP_PASS=your16charAppPassword
+# EMAIL_FROM="Royal Mansion Resort <info.royalmationresort@gmail.com>"
+# ADMIN_NOTIFICATION_EMAIL=owner@yourdomain.com
 ```
 
 4. Click **Save Changes**.
@@ -210,3 +233,26 @@ PAYHERE_CANCEL_URL=https://yourdomain.com/booking/cancel
   WHERE email = 'owner@royalmansion.lk';
   ```
   *(This sets the password back to `ChangeMe123!`)*.
+
+### 5. Email Not Sending (Client or Admin Confirmation Mails)
+If emails do not arrive after submitting or confirming bookings:
+1. **Run the SMTP Diagnostic Tool via cPanel Terminal:**
+   ```bash
+   node scripts/test-smtp.js
+   ```
+   Or send a direct test email:
+   ```bash
+   node scripts/test-smtp.js your_email@example.com
+   ```
+   This will test your DNS, socket connection, TLS handshake, and send a test message while showing exact diagnostic output.
+2. **Use the Admin Dashboard Test Button:**
+   - Log in at `https://yourdomain.com/admin/login`
+   - Navigate to **Settings** → **Email Notification: Booking Confirmation Notice**
+   - Click **Send Test Email** to verify delivery directly in your browser.
+3. **Inspect the Error Logs:**
+   - Check `logs/emails/email_errors.log` and `api.err.log` in cPanel File Manager for exact error messages (e.g. `ETIMEDOUT`, `EAUTH`, or certificate errors).
+4. **Common Fixes:**
+   - **Connection Timed Out (`ETIMEDOUT`):** Hosting firewall (CSF) is blocking port 587. Switch to your cPanel domain email on port 465 SSL (`SMTP_PORT=465` and `SMTP_SECURE=true`).
+   - **Self-signed / SSL Cert Mismatch:** Ensure `SMTP_TLS_REJECT_UNAUTHORIZED=false` is set in your `.env`.
+   - **Authentication Failed (`535`):** Verify `SMTP_USER` is the FULL email address (e.g. `reservations@yourdomain.com`) and password is correct.
+

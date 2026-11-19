@@ -11,6 +11,7 @@ exports.recordManualPayment = recordManualPayment;
 exports.refundPayment = refundPayment;
 const decimal_js_1 = __importDefault(require("decimal.js"));
 const apiResponse_1 = require("../lib/apiResponse");
+const emailService_1 = require("./emailService");
 function extractSlipInfo(payment) {
     let slipUrl = null;
     let bankReference = null;
@@ -90,6 +91,10 @@ async function verifyPayment(prisma, actor, id, meta) {
         });
         await tx.auditLog.create({ data: { adminUserId: actor.id, action: "PAYMENT_VERIFIED", entityType: "Payment", entityId: pay.id, oldValues: { verified: false }, newValues: { verified: true, amount: pay.amount }, ipAddress: meta?.ipAddress, userAgent: meta?.userAgent } });
         return { pay, booking };
+    });
+    // Automatically dispatch booking confirmation email to guest and admin notification upon payment slip verification
+    (0, emailService_1.sendBookingSummaryEmail)(prisma, updated.booking.id).catch((emailErr) => {
+        console.warn("⚠️ Failed to send booking confirmation email upon payment verification:", emailErr);
     });
     return updated;
 }

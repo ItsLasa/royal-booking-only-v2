@@ -9,6 +9,7 @@ const asyncHandler_1 = require("../lib/asyncHandler");
 const auth_1 = require("../middleware/auth");
 const audit_1 = require("../lib/audit");
 const settingsService_1 = require("../services/settingsService");
+const emailService_1 = require("../services/emailService");
 exports.settingsRoutes = (0, express_1.Router)();
 exports.settingsRoutes.use(auth_1.requireAdmin, (0, auth_1.requireRole)(["OWNER", "MANAGER"]));
 exports.settingsRoutes.get("/admin/settings", (0, asyncHandler_1.asyncHandler)(async (_req, res) => {
@@ -17,4 +18,12 @@ exports.settingsRoutes.get("/admin/settings", (0, asyncHandler_1.asyncHandler)(a
 exports.settingsRoutes.patch("/admin/settings", (0, auth_1.requireRole)(["OWNER", "MANAGER"]), (0, asyncHandler_1.asyncHandler)(async (req, res) => {
     const patch = zod_1.z.record(zod_1.z.string(), zod_1.z.unknown()).parse(req.body);
     res.json((0, apiResponse_1.ok)(await (0, settingsService_1.updateSettings)(prisma_1.prisma, req.adminUser, patch, (0, audit_1.auditMetaFrom)(req))));
+}));
+exports.settingsRoutes.post("/admin/settings/test-email", (0, auth_1.requireRole)(["OWNER", "MANAGER"]), (0, asyncHandler_1.asyncHandler)(async (req, res) => {
+    const testSchema = zod_1.z.object({
+        recipientEmail: zod_1.z.string().email().optional(),
+    });
+    const parsed = testSchema.parse(req.body || {});
+    const result = await (0, emailService_1.testSmtpConnection)(parsed.recipientEmail);
+    res.json((0, apiResponse_1.ok)(result));
 }));

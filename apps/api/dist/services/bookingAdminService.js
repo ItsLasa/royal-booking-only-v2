@@ -25,6 +25,7 @@ const dates_1 = require("../lib/dates");
 const availabilityService_1 = require("./availabilityService");
 const pricingService_1 = require("./pricingService");
 Object.defineProperty(exports, "quoteSchema", { enumerable: true, get: function () { return pricingService_1.quoteSchema; } });
+const emailService_1 = require("./emailService");
 const bookingInclude = {
     guest: true,
     package: { include: { unit: true } },
@@ -210,6 +211,10 @@ async function confirmBooking(prisma, actor, id, meta) {
         throw new apiResponse_1.ApiError(409, "INVALID_TRANSITION", "Cancelled bookings cannot be confirmed.");
     const updated = await prisma.booking.update({ where: { id }, data: { bookingStatus: "CONFIRMED", confirmedAt: new Date(), expiresAt: null }, include: bookingInclude });
     await (0, audit_1.writeAudit)(prisma, actor, "BOOKING_CONFIRMED", "Booking", updated.reference, { bookingStatus: booking.bookingStatus }, { bookingStatus: "CONFIRMED" }, meta);
+    // Automatically dispatch booking confirmation email to guest and admin notification
+    (0, emailService_1.sendBookingSummaryEmail)(prisma, updated.id).catch((emailErr) => {
+        console.warn("⚠️ Failed to send booking confirmation email upon admin confirmation:", emailErr);
+    });
     return updated;
 }
 async function cancelBooking(prisma, actor, id, reason, meta) {

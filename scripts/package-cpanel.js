@@ -71,6 +71,7 @@ copyFile("next.config.js");
 copyFile(".htaccess");
 copyFile("cpanel_database_setup.sql");
 copyFile("CPANEL_DEPLOYMENT_GUIDE.md");
+copyFile(path.join("scripts", "test-smtp.js"));
 
 // Copy public assets & API compiled distribution
 copyDir("public", "public");

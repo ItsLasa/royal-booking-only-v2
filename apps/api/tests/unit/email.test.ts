@@ -4,6 +4,7 @@ import {
   getDefaultFromEmail,
   sendEmail,
   sendBookingSummaryEmail,
+  testSmtpConnection,
 } from "../../src/services/emailService";
 
 describe("Nodemailer Email Service", () => {
@@ -91,5 +92,12 @@ describe("Nodemailer Email Service", () => {
     expect(res).toBe(true);
     expect(mockPrisma.booking.findFirst).toHaveBeenCalled();
     expect(mockPrisma.auditLog.create).toHaveBeenCalled();
+  });
+
+  it("should run testSmtpConnection and return diagnostic result", async () => {
+    const res = await testSmtpConnection("diag@example.test");
+    expect(res).toBeDefined();
+    expect(typeof res.success).toBe("boolean");
+    expect(res.diagnostics).toBeDefined();
   });
 });

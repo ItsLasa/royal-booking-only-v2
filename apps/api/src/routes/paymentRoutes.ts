@@ -130,6 +130,11 @@ paymentRoutes.post(
   async (req, res, next) => {
     try {
       const result = await processPayHereNotification(prisma, provider, req.body);
+      if (result.booking && result.booking.bookingStatus === "CONFIRMED" && !result.duplicate) {
+        sendBookingSummaryEmail(prisma, result.booking.id).catch((emailErr) => {
+          console.warn("⚠️ Failed to send booking confirmation email upon PayHere success:", emailErr);
+        });
+      }
       res.json(ok({ processed: true, duplicate: result.duplicate }));
     } catch (e) {
       next(e);

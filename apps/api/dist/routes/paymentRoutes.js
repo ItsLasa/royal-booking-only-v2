@@ -115,6 +115,11 @@ exports.paymentRoutes.post("/payments/payhere/create", (0, validation_1.validate
 exports.paymentRoutes.post("/payments/payhere/notify", (0, express_1.urlencoded)({ extended: false }), async (req, res, next) => {
     try {
         const result = await (0, payhere_1.processPayHereNotification)(prisma_1.prisma, provider, req.body);
+        if (result.booking && result.booking.bookingStatus === "CONFIRMED" && !result.duplicate) {
+            (0, emailService_1.sendBookingSummaryEmail)(prisma_1.prisma, result.booking.id).catch((emailErr) => {
+                console.warn("⚠️ Failed to send booking confirmation email upon PayHere success:", emailErr);
+            });
+        }
         res.json((0, apiResponse_1.ok)({ processed: true, duplicate: result.duplicate }));
     }
     catch (e) {

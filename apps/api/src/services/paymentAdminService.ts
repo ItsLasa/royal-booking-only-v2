@@ -2,6 +2,7 @@ import { Prisma, PrismaClient } from "@prisma/client";
 import Decimal from "decimal.js";
 import { ApiError } from "../lib/apiResponse";
 import { writeAudit, AdminActor, AuditMeta } from "../lib/audit";
+import { sendBookingSummaryEmail } from "./emailService";
 
 export type PaymentListQuery = { page?: number; pageSize?: number; status?: string; provider?: string; search?: string };
 
@@ -86,6 +87,11 @@ export async function verifyPayment(prisma: PrismaClient, actor: AdminActor, id:
     });
     await tx.auditLog.create({ data: { adminUserId: actor.id, action: "PAYMENT_VERIFIED", entityType: "Payment", entityId: pay.id, oldValues: { verified: false }, newValues: { verified: true, amount: pay.amount }, ipAddress: meta?.ipAddress, userAgent: meta?.userAgent } });
     return { pay, booking };
+  });
+
+  // Automatically dispatch booking confirmation email to guest and admin notification upon payment slip verification
+  sendBookingSummaryEmail(prisma, updated.booking.id).catch((emailErr) => {
+    console.warn("⚠️ Failed to send booking confirmation email upon payment verification:", emailErr);
   });
 
   return updated;

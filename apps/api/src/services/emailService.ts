@@ -14,7 +14,30 @@ function escapeHtml(str: string | null | undefined): string {
     .replace(/'/g, "&#039;");
 }
 
+/**
+ * Log email errors to both console and persistent log files for cPanel Passenger debugging.
+ */
+export function logEmailError(prefix: string, err: any) {
+  const line = `[${new Date().toISOString()}] ❌ [email-nodemailer] ${prefix}: ${err?.stack || err?.message || String(err)}\n`;
+  try {
+    const emailLogDir = path.resolve(process.cwd(), "logs/emails");
+    if (!fs.existsSync(emailLogDir)) fs.mkdirSync(emailLogDir, { recursive: true });
+    fs.appendFileSync(path.join(emailLogDir, "email_errors.log"), line);
+  } catch (_) {}
+  try {
+    fs.appendFileSync(path.resolve(process.cwd(), "api.err.log"), line);
+  } catch (_) {}
+  console.error(line.trim());
+}
+
 let cachedTransporter: Transporter | null = null;
+
+/**
+ * Reset cached transporter (useful when environment variables change or after connection failure).
+ */
+export function resetCachedTransporter(): void {
+  cachedTransporter = null;
+}
 
 /**
  * Resolve the sender address for emails sent by Nodemailer.
@@ -48,6 +71,9 @@ export function getEmailTransporter(): Transporter | null {
       user: env.SMTP_USER,
       pass: env.SMTP_PASS,
     },
+    connectionTimeout: env.SMTP_TIMEOUT_MS,
+    greetingTimeout: 10000,
+    socketTimeout: env.SMTP_TIMEOUT_MS,
   };
 
   if (env.SMTP_SERVICE) {
@@ -55,18 +81,20 @@ export function getEmailTransporter(): Transporter | null {
   } else if (env.SMTP_HOST) {
     transportOptions.host = env.SMTP_HOST;
     transportOptions.port = env.SMTP_PORT || 587;
-    transportOptions.secure = env.SMTP_SECURE || env.SMTP_PORT === 465;
+    const isPort465 = Number(env.SMTP_PORT) === 465;
+    transportOptions.secure = Boolean(env.SMTP_SECURE || isPort465);
   }
 
-  if (env.NODE_ENV !== "production") {
-    transportOptions.tls = { rejectUnauthorized: false };
-  }
+  // Support cPanel self-signed and shared certificates
+  transportOptions.tls = {
+    rejectUnauthorized: env.SMTP_TLS_REJECT_UNAUTHORIZED,
+  };
 
   try {
     cachedTransporter = nodemailer.createTransport(transportOptions);
     return cachedTransporter;
   } catch (err) {
-    console.error("❌ [email-nodemailer] Failed to initialize Nodemailer transporter:", err);
+    logEmailError("Failed to initialize Nodemailer transporter", err);
     return null;
   }
 }
@@ -318,7 +346,7 @@ Contact: +94 76 400 1245 | info.royalmationresort@gmail.com
         guestSent = true;
         console.log(`✅ [email-nodemailer] Booking summary delivered to guest: ${guestEmailRaw} (${booking.reference})`);
       } catch (guestErr) {
-        console.warn(`⚠️ [email-nodemailer] Failed to deliver booking summary to guest (${guestEmailRaw}):`, guestErr);
+        logEmailError(`Failed to deliver booking summary to guest (${guestEmailRaw})`, guestErr);
       }
 
       // 2. Send notification to Resort Admin
@@ -340,12 +368,13 @@ Contact: +94 76 400 1245 | info.royalmationresort@gmail.com
           adminSent = true;
           console.log(`✅ [email-nodemailer] Booking alert delivered to admin: ${adminEmail} (${booking.reference})`);
         } catch (adminErr) {
-          console.warn(`⚠️ [email-nodemailer] Failed to deliver booking alert to admin (${adminEmail}):`, adminErr);
+          logEmailError(`Failed to deliver booking alert to admin (${adminEmail})`, adminErr);
         }
       }
     } else {
-      console.warn(
-        `ℹ️ [email-nodemailer] SMTP is not configured (SMTP_USER, SMTP_PASS, SMTP_HOST/SMTP_SERVICE). Live email dispatch skipped. Email recorded locally.`
+      logEmailError(
+        "SMTP not configured",
+        "SMTP is not configured in .env (SMTP_USER, SMTP_PASS, SMTP_HOST/SMTP_SERVICE). Live email dispatch skipped. Email recorded locally."
       );
     }
 
@@ -381,7 +410,124 @@ Contact: +94 76 400 1245 | info.royalmationresort@gmail.com
 
     return true;
   } catch (err) {
-    console.error(`❌ [email-nodemailer] Error in sendBookingSummaryEmail:`, err);
+    logEmailError("Error in sendBookingSummaryEmail", err);
     return false;
+  }
+}
+
+/**
+ * Perform a live SMTP diagnostic test.
+ * Verifies connection, socket handshake, authentication, and optionally sends a test email.
+ */
+export async function testSmtpConnection(targetEmail?: string): Promise<{
+  success: boolean;
+  message: string;
+  diagnostics: {
+    host?: string;
+    port?: number;
+    secure?: boolean;
+    user?: string;
+    tlsRejectUnauthorized?: boolean;
+    verified?: boolean;
+    sent?: boolean;
+    messageId?: string;
+    error?: string;
+  };
+}> {
+  resetCachedTransporter();
+
+  const host = env.SMTP_HOST || env.SMTP_SERVICE || "Not configured";
+  const port = env.SMTP_PORT || (env.SMTP_SERVICE ? 465 : 587);
+  const secure = env.SMTP_SECURE || port === 465;
+  const user = env.SMTP_USER ? `${env.SMTP_USER.slice(0, 3)}***` : "Not configured";
+
+  const diag: any = {
+    host,
+    port,
+    secure,
+    user,
+    tlsRejectUnauthorized: env.SMTP_TLS_REJECT_UNAUTHORIZED,
+    verified: false,
+    sent: false,
+  };
+
+  const transporter = getEmailTransporter();
+  if (!transporter) {
+    const errorMsg = "SMTP credentials missing in .env (SMTP_USER, SMTP_PASS, SMTP_HOST/SMTP_SERVICE).";
+    logEmailError("testSmtpConnection", errorMsg);
+    return {
+      success: false,
+      message: errorMsg,
+      diagnostics: { ...diag, error: errorMsg },
+    };
+  }
+
+  // 1. Verify connection
+  try {
+    await transporter.verify();
+    diag.verified = true;
+  } catch (verifyErr: any) {
+    const errText = verifyErr?.message || String(verifyErr);
+    logEmailError("testSmtpConnection verification failed", verifyErr);
+    return {
+      success: false,
+      message: `SMTP Connection / Auth Failed: ${errText}`,
+      diagnostics: { ...diag, error: errText },
+    };
+  }
+
+  // 2. Dispatch test message
+  const recipient = targetEmail || env.ADMIN_NOTIFICATION_EMAIL || env.SMTP_USER;
+  if (!recipient) {
+    return {
+      success: true,
+      message: "SMTP connection & authentication verified successfully! (No recipient specified for test dispatch)",
+      diagnostics: diag,
+    };
+  }
+
+  try {
+    const from = getDefaultFromEmail();
+    const info = await transporter.sendMail({
+      from,
+      to: recipient,
+      subject: `[Diagnostic Test] Royal Mansion Resort Villa - ${new Date().toLocaleString()}`,
+      html: `
+        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;padding:24px;background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;">
+          <h2 style="color:#061b0e;margin-top:0;">✅ SMTP Connection Verified</h2>
+          <p style="color:#475569;font-size:15px;line-height:1.6;">
+            This is a live test email from <strong>Royal Mansion Resort Villa</strong> sent from your cPanel server.
+            If you received this email, your outgoing email delivery system is functioning correctly!
+          </p>
+          <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin:20px 0;font-size:14px;color:#334155;">
+            <div><strong>SMTP Host:</strong> ${host}</div>
+            <div><strong>SMTP Port:</strong> ${port} (Secure/SSL: ${secure ? "Yes" : "No"})</div>
+            <div><strong>TLS Reject Unauthorized:</strong> ${env.SMTP_TLS_REJECT_UNAUTHORIZED ? "Yes" : "No (cPanel compatible)"}</div>
+            <div><strong>From Sender:</strong> ${escapeHtml(from)}</div>
+            <div><strong>Delivered To:</strong> ${escapeHtml(recipient)}</div>
+            <div><strong>Server Time:</strong> ${new Date().toISOString()}</div>
+          </div>
+          <p style="color:#94a3b8;font-size:12px;margin:0;">
+            Royal Mansion Resort Villa · Automated Diagnostic Engine
+          </p>
+        </div>
+      `,
+      text: `SMTP Connection Verified!\nHost: ${host}:${port}\nSent to: ${recipient}\nTimestamp: ${new Date().toISOString()}`,
+    });
+    diag.sent = true;
+    diag.messageId = info.messageId;
+    return {
+      success: true,
+      message: `Test email successfully dispatched to ${recipient}! (Message ID: ${info.messageId})`,
+      diagnostics: diag,
+    };
+  } catch (sendErr: any) {
+    const errText = sendErr?.message || String(sendErr);
+    logEmailError(`testSmtpConnection sending to ${recipient}`, sendErr);
+    return {
+      success: false,
+      message: `Connected successfully, but test email sending failed: ${errText}`,
+      diagnostics: { ...diag, error: errText },
+    };
   }
 }

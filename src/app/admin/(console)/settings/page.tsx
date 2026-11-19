@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { toast } from "sonner";
-import { adminGet, adminPatch } from "@/lib/admin/api";
+import { adminGet, adminPatch, adminPost } from "@/lib/admin/api";
 import { Button, Card, CardBody, CardHeader, EmptyState, Field, Input, PageHeader, Textarea } from "@/components/admin/ui";
 
 type Settings = {
@@ -19,6 +19,9 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [testRecipient, setTestRecipient] = useState("");
+  const [testingEmail, setTestingEmail] = useState(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; message: string; diagnostics?: any } | null>(null);
 
   const load = () => {
     setLoading(true);
@@ -41,6 +44,28 @@ export default function SettingsPage() {
       toast.error(err instanceof Error ? err.message : "Could not save settings");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleTestEmail() {
+    setTestingEmail(true);
+    setTestResult(null);
+    try {
+      const res = await adminPost<{ success: boolean; message: string; diagnostics: any }>("/admin/settings/test-email", {
+        recipientEmail: testRecipient.trim() || undefined,
+      });
+      setTestResult(res);
+      if (res.success) {
+        toast.success("SMTP Connection Verified! Email dispatched.");
+      } else {
+        toast.error(res.message);
+      }
+    } catch (err: any) {
+      const msg = err instanceof Error ? err.message : "SMTP test failed";
+      setTestResult({ success: false, message: msg });
+      toast.error(msg);
+    } finally {
+      setTestingEmail(false);
     }
   }
 
@@ -153,6 +178,52 @@ export default function SettingsPage() {
           <Field label="Email Body Message" hint="Available dynamic tags: {guestName}, {reference}, {checkIn}, {checkOut}, {grandTotal}">
             <Textarea value={settings.emailTemplates.bookingConfirmed.body} onChange={(event) => set("emailTemplates", "bookingConfirmed", { ...settings.emailTemplates.bookingConfirmed, body: event.target.value })} />
           </Field>
+
+          <div className="mt-6 pt-6 border-t border-outline-variant/50 dark:border-white/10 space-y-3">
+            <div>
+              <h4 className="text-sm font-semibold text-on-surface dark:text-white">
+                🧪 Live SMTP Connection & Delivery Test
+              </h4>
+              <p className="text-xs text-on-surface-variant dark:text-neutral-400 mt-0.5">
+                Verify that your cPanel mail server, SSL handshake, and credentials are functioning properly.
+              </p>
+            </div>
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+              <Input
+                placeholder="Optional test recipient (e.g. your email)"
+                value={testRecipient}
+                onChange={(e) => setTestRecipient(e.target.value)}
+                className="flex-1"
+              />
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleTestEmail}
+                loading={testingEmail}
+              >
+                Send Test Email
+              </Button>
+            </div>
+            {testResult && (
+              <div
+                className={`p-3 rounded-lg text-xs leading-relaxed ${
+                  testResult.success
+                    ? "bg-emerald-500/10 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30"
+                    : "bg-red-500/10 text-red-800 dark:text-red-300 border border-red-500/30"
+                }`}
+              >
+                <div className="font-semibold mb-1">
+                  {testResult.success ? "✅ Connection Verified" : "❌ Connection / Delivery Failed"}
+                </div>
+                <div>{testResult.message}</div>
+                {testResult.diagnostics?.error && (
+                  <div className="mt-1 font-mono text-[11px] opacity-90">
+                    Error trace: {testResult.diagnostics.error}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </CardBody>
       </Card>
     </div>
