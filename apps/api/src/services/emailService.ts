@@ -38,14 +38,17 @@ export function resetResendClient(): void {
 
 /**
  * Log email errors to both console and persistent log files for cPanel Passenger debugging.
+ * NOTE: callers include their own tag in `prefix` (e.g. "[email-resend] ..."), so no
+ * provider label is hardcoded here anymore.
  */
 export function logEmailError(prefix: string, err: any) {
   const errMsg = err?.stack || err?.message || String(err);
   let hint = "";
   if (typeof errMsg === "string" && errMsg.includes("ENOTFOUND")) {
-    hint = "\n👉 [cPanel Hint] DNS resolution failed for SMTP host. If running on cPanel, set SMTP_HOST=localhost or SMTP_HOST=127.0.0.1 in your .env to connect to local Exim without DNS lookups.";
+    hint =
+      "\n👉 [cPanel Hint] DNS resolution failed for SMTP host. If running on cPanel, set SMTP_HOST=localhost or SMTP_HOST=127.0.0.1 in your .env to connect to local Exim without DNS lookups.";
   }
-  const line = `[${new Date().toISOString()}] ❌ [email-nodemailer] ${prefix}: ${errMsg}${hint}\n`;
+  const line = `[${new Date().toISOString()}] ❌ [email] ${prefix}: ${errMsg}${hint}\n`;
   try {
     const emailLogDir = path.resolve(process.cwd(), "logs/emails");
     if (!fs.existsSync(emailLogDir)) fs.mkdirSync(emailLogDir, { recursive: true });
@@ -66,30 +69,63 @@ export function resetCachedTransporter(): void {
   cachedTransporter = null;
 }
 
+// ---------------------------------------------------------------------------
+// Sender address handling
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SENDER_NAME = "Royal Mansion Resort";
+
+// email@example.com
+const BARE_EMAIL_RE = /^[^\s<>@"']+@[^\s<>@"']+\.[^\s<>@"']+$/;
+// Name <email@example.com>
+const NAMED_EMAIL_RE = /^[^<>]+<[^\s<>@"']+@[^\s<>@"']+\.[^\s<>@"']+>$/;
+
+let warnedInvalidFrom = false;
+
+/**
+ * Normalize a raw sender value into a format Resend/SMTP accepts:
+ *   - trims whitespace / newlines
+ *   - strips quotes wrapping the whole value (common with Docker env_file / cPanel env editors)
+ *   - accepts "email@x.com" (adds a display name) or "Name <email@x.com>"
+ * Returns null if the value cannot be made valid.
+ */
+export function normalizeFromAddress(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const value = String(raw)
+    .trim()
+    .replace(/^(["'])([\s\S]*)\1$/, "$2")
+    .trim();
+  if (!value) return null;
+
+  if (NAMED_EMAIL_RE.test(value)) return value;
+  if (BARE_EMAIL_RE.test(value)) return `${DEFAULT_SENDER_NAME} <${value}>`;
+  return null;
+}
+
 /**
  * Resolve the sender address for outgoing emails (Resend or Nodemailer).
  */
 export function getDefaultFromEmail(): string {
-  if (env.EMAIL_FROM && env.EMAIL_FROM.trim().length > 0) {
-    const trimmed = env.EMAIL_FROM.trim();
-    if (trimmed.includes("<") && trimmed.includes(">")) {
-      return trimmed;
-    }
-    if (trimmed.includes("@")) {
-      return `Royal Mansion Resort <${trimmed}>`;
-    }
-    return trimmed;
+  const configured = normalizeFromAddress(env.EMAIL_FROM);
+  if (configured) return configured;
+
+  if (env.EMAIL_FROM && env.EMAIL_FROM.trim().length > 0 && !warnedInvalidFrom) {
+    warnedInvalidFrom = true;
+    console.warn(
+      `⚠️ [email] EMAIL_FROM is invalid and was ignored: ${JSON.stringify(env.EMAIL_FROM)}. ` +
+        `Use "email@example.com" or "Name <email@example.com>" (no outer quotes).`
+    );
   }
 
-  // If using Resend without explicit EMAIL_FROM
+  // If using Resend without explicit EMAIL_FROM (only delivers to your own Resend account email)
   if (env.RESEND_API_KEY && !env.SMTP_USER) {
-    return "Royal Mansion Resort <onboarding@resend.dev>";
+    return `${DEFAULT_SENDER_NAME} <onboarding@resend.dev>`;
   }
 
-  if (env.SMTP_USER && env.SMTP_USER.includes("@")) {
-    return `Royal Mansion Resort <${env.SMTP_USER}>`;
-  }
-  return "Royal Mansion Resort <info.royalmansionresort@gmail.com>";
+  const smtpFrom = normalizeFromAddress(env.SMTP_USER);
+  if (smtpFrom) return smtpFrom;
+
+  return `${DEFAULT_SENDER_NAME} <info.royalmansionresort@gmail.com>`;
 }
 
 /**
@@ -134,7 +170,7 @@ export function getEmailTransporter(): Transporter | null {
     cachedTransporter = nodemailer.createTransport(transportOptions);
     return cachedTransporter;
   } catch (err) {
-    logEmailError("Failed to initialize Nodemailer transporter", err);
+    logEmailError("[email-nodemailer] Failed to initialize Nodemailer transporter", err);
     return null;
   }
 }
@@ -215,7 +251,7 @@ export async function sendMailWithFallback(
         console.log(`✅ [email-nodemailer] Delivered email via local cPanel fallback (127.0.0.1).`);
         return fallbackResult;
       } catch (fallbackErr) {
-        logEmailError("Local cPanel fallback (127.0.0.1) also failed", fallbackErr);
+        logEmailError("[email-nodemailer] Local cPanel fallback (127.0.0.1) also failed", fallbackErr);
       }
     }
 
@@ -243,9 +279,14 @@ export interface SendEmailResult {
  * 1. Resend API (HTTPS REST) if RESEND_API_KEY is configured.
  * 2. Nodemailer SMTP if SMTP credentials are configured.
  * 3. Local file log backup in logs/emails/ (offline/dev fallback).
+ *
+ * The returned `error` now always contains the real failure reason (e.g. the Resend API
+ * message), so callers and logs can see why delivery failed.
  */
 export async function sendEmail(options: SendMailOptions): Promise<SendEmailResult> {
-  const from = options.from || getDefaultFromEmail();
+  // Normalize any caller-supplied sender; fall back to the validated default.
+  const from = normalizeFromAddress(options.from) ?? getDefaultFromEmail();
+  const toRecipients = Array.isArray(options.to) ? options.to : [options.to];
 
   // Always write backup to disk
   try {
@@ -257,11 +298,12 @@ export async function sendEmail(options: SendMailOptions): Promise<SendEmailResu
     // Ignore log dir write errors
   }
 
+  let resendError: string | undefined;
+
   // 1. Try Resend if configured
   const resend = getResendClient();
   if (resend) {
     try {
-      const toRecipients = Array.isArray(options.to) ? options.to : [options.to];
       const { data, error } = await resend.emails.send({
         from,
         to: toRecipients,
@@ -271,13 +313,17 @@ export async function sendEmail(options: SendMailOptions): Promise<SendEmailResu
       });
 
       if (error) {
-        logEmailError(`[email-resend] Resend API error for ${toRecipients.join(", ")}`, error);
+        resendError = error.message || "Unknown error from Resend API";
+        logEmailError(`[email-resend] Resend API error for ${toRecipients.join(", ")} (from: ${JSON.stringify(from)})`, error);
       } else if (data?.id) {
         console.log(`✅ [email-resend] Mail delivered to ${toRecipients.join(", ")} (Resend ID: ${data.id})`);
         return { sent: true, provider: "resend", messageId: data.id };
+      } else {
+        resendError = "Resend returned no message ID";
       }
     } catch (err: any) {
-      logEmailError(`[email-resend] Resend dispatch exception for ${options.to}`, err);
+      resendError = err?.message || String(err);
+      logEmailError(`[email-resend] Resend dispatch exception for ${toRecipients.join(", ")}`, err);
     }
   }
 
@@ -292,25 +338,39 @@ export async function sendEmail(options: SendMailOptions): Promise<SendEmailResu
         html: options.html,
         text: options.text,
       });
-      console.log(`✅ [email-nodemailer] Mail delivered to ${options.to} (ID: ${info.messageId})`);
+      console.log(`✅ [email-nodemailer] Mail delivered to ${toRecipients.join(", ")} (ID: ${info.messageId})`);
       return { sent: true, provider: "nodemailer", messageId: info.messageId };
     } catch (err: any) {
-      console.error(`❌ [email-nodemailer] Failed sending email to ${options.to}:`, err);
-      return { sent: false, provider: "nodemailer", error: err?.message || String(err) };
+      console.error(`❌ [email-nodemailer] Failed sending email to ${toRecipients.join(", ")}:`, err);
+      const smtpError = err?.message || String(err);
+      return {
+        sent: false,
+        provider: "nodemailer",
+        error: resendError ? `Resend: ${resendError} | SMTP: ${smtpError}` : smtpError,
+      };
     }
   }
 
   if (!resend && !transporter) {
-    console.warn(`ℹ️ [email] No active email provider (RESEND_API_KEY or SMTP) configured. Recorded email locally to logs/emails/.`);
+    console.warn(
+      `ℹ️ [email] No active email provider (RESEND_API_KEY or SMTP) configured. Recorded email locally to logs/emails/.`
+    );
     return { sent: false, provider: "logged", error: "No email provider configured in .env" };
   }
 
-  return { sent: false, error: "Failed to dispatch email across available providers" };
+  // Resend was configured but failed, and there is no SMTP fallback
+  return {
+    sent: false,
+    provider: "resend",
+    error: resendError ?? "Failed to dispatch email across available providers",
+  };
 }
 
 /**
  * Send complete booking summary and confirmation email to guest and admin alert.
  * Uses Resend API when RESEND_API_KEY is available, falling back to Nodemailer SMTP.
+ *
+ * Returns true only when the GUEST confirmation was actually delivered.
  */
 export async function sendBookingSummaryEmail(prisma: PrismaClient, bookingIdOrRef: string): Promise<boolean> {
   try {
@@ -454,7 +514,7 @@ export async function sendBookingSummaryEmail(prisma: PrismaClient, bookingIdOrR
     const plainText = `
 Royal Mansion Resort Villa - Booking Summary
 Reference: ${booking.reference}
-Guest: ${guestName} (${booking.guest.email})
+Guest: ${guestNameRaw} (${booking.guest.email})
 Package: ${booking.package?.name ?? "Royal Mansion Villa Package"}
 Check-in: ${checkIn} (from 14:00)
 Check-out: ${checkOut} (until 11:00)
@@ -474,9 +534,12 @@ Contact: +94 76 400 1245 | info.royalmansionresort@gmail.com
 
     let guestSent = false;
     let adminSent = false;
-    let usedProvider: "resend" | "nodemailer" | "logged" = "logged";
+    let guestProvider: "resend" | "nodemailer" | "logged" = "logged";
+    let adminProvider: "resend" | "nodemailer" | "logged" | undefined;
     let guestMessageId: string | undefined;
     let adminMessageId: string | undefined;
+    let guestError: string | undefined;
+    let adminError: string | undefined;
 
     // 1. Send confirmation to Guest
     try {
@@ -488,12 +551,16 @@ Contact: +94 76 400 1245 | info.royalmansionresort@gmail.com
         text: plainText,
       });
       guestSent = guestResult.sent;
-      if (guestResult.provider) usedProvider = guestResult.provider;
+      if (guestResult.provider) guestProvider = guestResult.provider;
       guestMessageId = guestResult.messageId;
+      guestError = guestResult.error;
       if (guestSent) {
-        console.log(`✅ [email] Booking summary delivered to guest: ${guestEmailRaw} (${booking.reference}) via ${usedProvider}`);
+        console.log(`✅ [email] Booking summary delivered to guest: ${guestEmailRaw} (${booking.reference}) via ${guestProvider}`);
+      } else {
+        console.error(`❌ [email] Guest confirmation NOT delivered for ${booking.reference}: ${guestError}`);
       }
-    } catch (guestErr) {
+    } catch (guestErr: any) {
+      guestError = guestErr?.message || String(guestErr);
       logEmailError(`Failed to deliver booking summary to guest (${guestEmailRaw})`, guestErr);
     }
 
@@ -514,12 +581,16 @@ Contact: +94 76 400 1245 | info.royalmansionresort@gmail.com
           text: `[Admin Alert: New booking from ${guestNameRaw} (${guestEmailRaw})]\n\n${plainText}`,
         });
         adminSent = adminResult.sent;
-        if (adminResult.provider) usedProvider = adminResult.provider;
+        adminProvider = adminResult.provider;
         adminMessageId = adminResult.messageId;
+        adminError = adminResult.error;
         if (adminSent) {
-          console.log(`✅ [email] Booking alert delivered to admin: ${adminEmail} (${booking.reference}) via ${usedProvider}`);
+          console.log(`✅ [email] Booking alert delivered to admin: ${adminEmail} (${booking.reference}) via ${adminProvider}`);
+        } else {
+          console.error(`❌ [email] Admin alert NOT delivered for ${booking.reference}: ${adminError}`);
         }
-      } catch (adminErr) {
+      } catch (adminErr: any) {
+        adminError = adminErr?.message || String(adminErr);
         logEmailError(`Failed to deliver booking alert to admin (${adminEmail})`, adminErr);
       }
     }
@@ -543,20 +614,24 @@ Contact: +94 76 400 1245 | info.royalmansionresort@gmail.com
           entityType: "Booking",
           entityId: booking.reference,
           newValues: {
-            to: guestEmail,
+            to: guestEmailRaw,
             subject,
             delivery: guestSent || adminSent ? "SENT" : "LOGGED",
             guestDelivered: guestSent,
             adminDelivered: adminSent,
-            service: usedProvider,
+            guestService: guestProvider,
+            adminService: adminProvider,
             guestMessageId,
             adminMessageId,
+            guestError,
+            adminError,
           },
         },
       })
       .catch(() => null);
 
-    return true;
+    // Only report success if the guest actually received the confirmation.
+    return guestSent;
   } catch (err) {
     logEmailError("Error in sendBookingSummaryEmail", err);
     return false;
@@ -577,6 +652,7 @@ export async function testSmtpConnection(targetEmail?: string): Promise<{
     port?: number;
     secure?: boolean;
     user?: string;
+    from?: string;
     tlsRejectUnauthorized?: boolean;
     verified?: boolean;
     sent?: boolean;
@@ -593,6 +669,7 @@ export async function testSmtpConnection(targetEmail?: string): Promise<{
       provider: "resend",
       host: "api.resend.com",
       user: env.RESEND_API_KEY ? `${env.RESEND_API_KEY.slice(0, 5)}...` : undefined,
+      from,
       verified: true,
       sent: false,
     };
@@ -666,6 +743,7 @@ export async function testSmtpConnection(targetEmail?: string): Promise<{
     port,
     secure,
     user,
+    from: getDefaultFromEmail(),
     tlsRejectUnauthorized: env.SMTP_TLS_REJECT_UNAUTHORIZED,
     verified: false,
     sent: false,
@@ -674,7 +752,7 @@ export async function testSmtpConnection(targetEmail?: string): Promise<{
   const transporter = getEmailTransporter();
   if (!transporter) {
     const errorMsg = "Neither RESEND_API_KEY nor SMTP credentials (SMTP_USER, SMTP_PASS, SMTP_HOST) are configured in .env.";
-    logEmailError("testSmtpConnection", errorMsg);
+    logEmailError("[email-nodemailer] testSmtpConnection", errorMsg);
     return {
       success: false,
       provider: "none",
@@ -690,7 +768,7 @@ export async function testSmtpConnection(targetEmail?: string): Promise<{
   } catch (verifyErr: any) {
     resetCachedTransporter();
     const errText = verifyErr?.message || String(verifyErr);
-    logEmailError("testSmtpConnection verification failed", verifyErr);
+    logEmailError("[email-nodemailer] testSmtpConnection verification failed", verifyErr);
     return {
       success: false,
       provider: "nodemailer",
@@ -724,7 +802,7 @@ export async function testSmtpConnection(targetEmail?: string): Promise<{
             If you received this email, your outgoing email delivery system is functioning correctly!
           </p>
           <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin:20px 0;font-size:14px;color:#334155;">
-            <div><strong>SMTP Host:</strong> ${host}</div>
+            <div><strong>SMTP Host:</strong> ${escapeHtml(String(host))}</div>
             <div><strong>SMTP Port:</strong> ${port} (Secure/SSL: ${secure ? "Yes" : "No"})</div>
             <div><strong>TLS Reject Unauthorized:</strong> ${env.SMTP_TLS_REJECT_UNAUTHORIZED ? "Yes" : "No (cPanel compatible)"}</div>
             <div><strong>From Sender:</strong> ${escapeHtml(from)}</div>
@@ -748,7 +826,7 @@ export async function testSmtpConnection(targetEmail?: string): Promise<{
     };
   } catch (sendErr: any) {
     const errText = sendErr?.message || String(sendErr);
-    logEmailError(`testSmtpConnection sending to ${recipient}`, sendErr);
+    logEmailError(`[email-nodemailer] testSmtpConnection sending to ${recipient}`, sendErr);
     return {
       success: false,
       provider: "nodemailer",
@@ -759,4 +837,3 @@ export async function testSmtpConnection(targetEmail?: string): Promise<{
 }
 
 export const testEmailConnection = testSmtpConnection;
-
