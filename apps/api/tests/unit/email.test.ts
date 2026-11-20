@@ -1,17 +1,40 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import nodemailer from "nodemailer";
+
+const resendSendMock = vi.fn().mockResolvedValue({
+  data: { id: "resend-msg-abc" },
+  error: null,
+});
+
+vi.mock("resend", () => {
+  return {
+    Resend: class {
+      emails = {
+        send: resendSendMock,
+      };
+    },
+  };
+});
+
 import {
   getDefaultFromEmail,
   sendEmail,
   sendBookingSummaryEmail,
   testSmtpConnection,
+  resetResendClient,
+  resetCachedTransporter,
 } from "../../src/services/emailService";
+import { env } from "../../src/config/env";
 
-describe("Nodemailer Email Service", () => {
-  const sendMailMock = vi.fn().mockResolvedValue({ messageId: "test-msg-123" });
+describe("Email Service (Resend & Nodemailer)", () => {
+  const sendMailMock = vi.fn().mockResolvedValue({ messageId: "smtp-msg-123" });
 
   beforeEach(() => {
     vi.clearAllMocks();
+    resetResendClient();
+    resetCachedTransporter();
+
+    // Mock Nodemailer
     vi.spyOn(nodemailer, "createTransport").mockReturnValue({
       sendMail: sendMailMock,
       verify: vi.fn().mockResolvedValue(true),
@@ -25,8 +48,38 @@ describe("Nodemailer Email Service", () => {
     expect(from).toContain("Royal Mansion Resort");
   });
 
-  it("should send email via nodemailer and return success", async () => {
-    // When SMTP config is present or simulated
+  it("should send email via Resend when RESEND_API_KEY is configured", async () => {
+    const origKey = env.RESEND_API_KEY;
+    (env as any).RESEND_API_KEY = "re_test_key_123";
+    resetResendClient();
+
+    const result = await sendEmail({
+      to: "guest@example.com",
+      subject: "Welcome to Royal Mansion",
+      html: "<p>Welcome!</p>",
+      text: "Welcome!",
+    });
+
+    expect(result.sent).toBe(true);
+    expect(result.provider).toBe("resend");
+    expect(result.messageId).toBe("resend-msg-abc");
+    expect(resendSendMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: ["guest@example.com"],
+        subject: "Welcome to Royal Mansion",
+      })
+    );
+
+    // Restore
+    (env as any).RESEND_API_KEY = origKey;
+    resetResendClient();
+  });
+
+  it("should fallback to Nodemailer when RESEND_API_KEY is absent", async () => {
+    const origKey = env.RESEND_API_KEY;
+    (env as any).RESEND_API_KEY = undefined;
+    resetResendClient();
+
     const result = await sendEmail({
       to: "guest@example.com",
       subject: "Test Subject",
@@ -34,9 +87,15 @@ describe("Nodemailer Email Service", () => {
       text: "Hello",
     });
 
-    // In environment without SMTP credentials, result.sent is false and logs gracefully
     expect(result).toBeDefined();
-    expect(typeof result.sent).toBe("boolean");
+    expect(result.sent).toBe(true);
+    expect(result.provider).toBe("nodemailer");
+    expect(result.messageId).toBe("smtp-msg-123");
+    expect(sendMailMock).toHaveBeenCalled();
+
+    // Restore
+    (env as any).RESEND_API_KEY = origKey;
+    resetResendClient();
   });
 
   it("should handle sendBookingSummaryEmail gracefully for non-existent booking", async () => {
@@ -53,7 +112,11 @@ describe("Nodemailer Email Service", () => {
     expect(res).toBe(false);
   });
 
-  it("should format and process booking summary email for valid booking", async () => {
+  it("should format and process booking summary email for valid booking via Resend", async () => {
+    const origKey = env.RESEND_API_KEY;
+    (env as any).RESEND_API_KEY = "re_test_key_123";
+    resetResendClient();
+
     const mockBooking: any = {
       id: "booking-1",
       reference: "RMR-202611-TEST1",
@@ -92,12 +155,27 @@ describe("Nodemailer Email Service", () => {
     expect(res).toBe(true);
     expect(mockPrisma.booking.findFirst).toHaveBeenCalled();
     expect(mockPrisma.auditLog.create).toHaveBeenCalled();
+    expect(resendSendMock).toHaveBeenCalled();
+
+    // Restore
+    (env as any).RESEND_API_KEY = origKey;
+    resetResendClient();
   });
 
-  it("should run testSmtpConnection and return diagnostic result", async () => {
+  it("should run testSmtpConnection with Resend diagnostic result when API key is set", async () => {
+    const origKey = env.RESEND_API_KEY;
+    (env as any).RESEND_API_KEY = "re_test_key_123";
+    resetResendClient();
+
     const res = await testSmtpConnection("diag@example.test");
     expect(res).toBeDefined();
-    expect(typeof res.success).toBe("boolean");
-    expect(res.diagnostics).toBeDefined();
+    expect(res.success).toBe(true);
+    expect(res.provider).toBe("resend");
+    expect(res.diagnostics?.sent).toBe(true);
+    expect(res.diagnostics?.messageId).toBe("resend-msg-abc");
+
+    // Restore
+    (env as any).RESEND_API_KEY = origKey;
+    resetResendClient();
   });
 });

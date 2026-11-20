@@ -3,6 +3,9 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.testEmailConnection = void 0;
+exports.getResendClient = getResendClient;
+exports.resetResendClient = resetResendClient;
 exports.logEmailError = logEmailError;
 exports.resetCachedTransporter = resetCachedTransporter;
 exports.getDefaultFromEmail = getDefaultFromEmail;
@@ -13,6 +16,7 @@ exports.sendEmail = sendEmail;
 exports.sendBookingSummaryEmail = sendBookingSummaryEmail;
 exports.testSmtpConnection = testSmtpConnection;
 const nodemailer_1 = __importDefault(require("nodemailer"));
+const resend_1 = require("resend");
 const env_1 = require("../config/env");
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
@@ -25,6 +29,25 @@ function escapeHtml(str) {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
+}
+let resendClient = null;
+/**
+ * Return cached Resend client instance if RESEND_API_KEY is configured.
+ */
+function getResendClient() {
+    const apiKey = env_1.env.RESEND_API_KEY?.trim();
+    if (!apiKey)
+        return null;
+    if (!resendClient) {
+        resendClient = new resend_1.Resend(apiKey);
+    }
+    return resendClient;
+}
+/**
+ * Reset Resend client (useful in unit testing or configuration reloads).
+ */
+function resetResendClient() {
+    resendClient = null;
 }
 /**
  * Log email errors to both console and persistent log files for cPanel Passenger debugging.
@@ -57,16 +80,27 @@ function resetCachedTransporter() {
     cachedTransporter = null;
 }
 /**
- * Resolve the sender address for emails sent by Nodemailer.
+ * Resolve the sender address for outgoing emails (Resend or Nodemailer).
  */
 function getDefaultFromEmail() {
-    if (env_1.env.EMAIL_FROM && !env_1.env.EMAIL_FROM.includes("resend.dev") && !env_1.env.EMAIL_FROM.includes("localhost")) {
-        return env_1.env.EMAIL_FROM;
+    if (env_1.env.EMAIL_FROM && env_1.env.EMAIL_FROM.trim().length > 0) {
+        const trimmed = env_1.env.EMAIL_FROM.trim();
+        if (trimmed.includes("<") && trimmed.includes(">")) {
+            return trimmed;
+        }
+        if (trimmed.includes("@")) {
+            return `Royal Mansion Resort <${trimmed}>`;
+        }
+        return trimmed;
+    }
+    // If using Resend without explicit EMAIL_FROM
+    if (env_1.env.RESEND_API_KEY && !env_1.env.SMTP_USER) {
+        return "Royal Mansion Resort <onboarding@resend.dev>";
     }
     if (env_1.env.SMTP_USER && env_1.env.SMTP_USER.includes("@")) {
         return `Royal Mansion Resort <${env_1.env.SMTP_USER}>`;
     }
-    return "Royal Mansion Resort <info.royalmationresort@gmail.com>";
+    return "Royal Mansion Resort <info.royalmansionresort@gmail.com>";
 }
 /**
  * Create or return a cached Nodemailer SMTP transporter.
@@ -185,11 +219,13 @@ async function sendMailWithFallback(mailOptions) {
     }
 }
 /**
- * Generic helper to send an email using Nodemailer.
+ * Generic helper to send an email with automatic provider selection:
+ * 1. Resend API (HTTPS REST) if RESEND_API_KEY is configured.
+ * 2. Nodemailer SMTP if SMTP credentials are configured.
+ * 3. Local file log backup in logs/emails/ (offline/dev fallback).
  */
 async function sendEmail(options) {
     const from = options.from || getDefaultFromEmail();
-    const transporter = getEmailTransporter();
     // Always write backup to disk
     try {
         const emailLogDir = path_1.default.resolve(process.cwd(), "logs/emails");
@@ -201,28 +237,58 @@ async function sendEmail(options) {
     catch {
         // Ignore log dir write errors
     }
-    if (!transporter) {
-        console.warn(`ℹ️ [email-nodemailer] SMTP not configured. Skipped sending to ${options.to}. Subject: ${options.subject}`);
-        return { sent: false, error: "SMTP not configured" };
+    // 1. Try Resend if configured
+    const resend = getResendClient();
+    if (resend) {
+        try {
+            const toRecipients = Array.isArray(options.to) ? options.to : [options.to];
+            const { data, error } = await resend.emails.send({
+                from,
+                to: toRecipients,
+                subject: options.subject,
+                html: options.html,
+                text: options.text,
+            });
+            if (error) {
+                logEmailError(`[email-resend] Resend API error for ${toRecipients.join(", ")}`, error);
+            }
+            else if (data?.id) {
+                console.log(`✅ [email-resend] Mail delivered to ${toRecipients.join(", ")} (Resend ID: ${data.id})`);
+                return { sent: true, provider: "resend", messageId: data.id };
+            }
+        }
+        catch (err) {
+            logEmailError(`[email-resend] Resend dispatch exception for ${options.to}`, err);
+        }
     }
-    try {
-        const info = await sendMailWithFallback({
-            from,
-            to: options.to,
-            subject: options.subject,
-            html: options.html,
-            text: options.text,
-        });
-        console.log(`✅ [email-nodemailer] Mail delivered to ${options.to} (ID: ${info.messageId})`);
-        return { sent: true, messageId: info.messageId };
+    // 2. Fallback to Nodemailer SMTP if configured
+    const transporter = getEmailTransporter();
+    if (transporter) {
+        try {
+            const info = await sendMailWithFallback({
+                from,
+                to: options.to,
+                subject: options.subject,
+                html: options.html,
+                text: options.text,
+            });
+            console.log(`✅ [email-nodemailer] Mail delivered to ${options.to} (ID: ${info.messageId})`);
+            return { sent: true, provider: "nodemailer", messageId: info.messageId };
+        }
+        catch (err) {
+            console.error(`❌ [email-nodemailer] Failed sending email to ${options.to}:`, err);
+            return { sent: false, provider: "nodemailer", error: err?.message || String(err) };
+        }
     }
-    catch (err) {
-        console.error(`❌ [email-nodemailer] Failed sending email to ${options.to}:`, err);
-        return { sent: false, error: err?.message || String(err) };
+    if (!resend && !transporter) {
+        console.warn(`ℹ️ [email] No active email provider (RESEND_API_KEY or SMTP) configured. Recorded email locally to logs/emails/.`);
+        return { sent: false, provider: "logged", error: "No email provider configured in .env" };
     }
+    return { sent: false, error: "Failed to dispatch email across available providers" };
 }
 /**
- * Send complete booking summary and confirmation email to guest and admin alert via Nodemailer.
+ * Send complete booking summary and confirmation email to guest and admin alert.
+ * Uses Resend API when RESEND_API_KEY is available, falling back to Nodemailer SMTP.
  */
 async function sendBookingSummaryEmail(prisma, bookingIdOrRef) {
     try {
@@ -239,7 +305,7 @@ async function sendBookingSummaryEmail(prisma, bookingIdOrRef) {
             },
         });
         if (!booking || !booking.guest?.email) {
-            console.warn(`[email-nodemailer] Booking or guest email not found for ${bookingIdOrRef}`);
+            console.warn(`[email] Booking or guest email not found for ${bookingIdOrRef}`);
             return false;
         }
         const checkIn = new Date(booking.checkInDate).toLocaleDateString("en-GB", {
@@ -344,13 +410,13 @@ async function sendBookingSummaryEmail(prisma, bookingIdOrRef) {
           <strong>Royal Mansion Resort Villa</strong><br />
           No.21, Prime Panoramic, Paradeka, Pussallawa, Sri Lanka<br />
           Phone / WhatsApp: +94 76 400 1245<br />
-          Email: info.royalmationresort@gmail.com
+          Email: info.royalmansionresort@gmail.com
         </p>
       </div>
     </div>
     <div class="footer">
       <p>© 2026 Royal Mansion Resort Villa. All rights reserved.</p>
-      <p>Have questions? Email us directly at <a href="mailto:info.royalmationresort@gmail.com">info.royalmationresort@gmail.com</a> or call +94 76 400 1245.</p>
+      <p>Have questions? Email us directly at <a href="mailto:info.royalmansionresort@gmail.com">info.royalmansionresort@gmail.com</a> or call +94 76 400 1245.</p>
     </div>
   </div>
 </body>
@@ -369,57 +435,63 @@ Deposit: ${lkr(booking.depositRequired)}
 Balance Due on Arrival: ${lkr(booking.balanceDue)}
 
 Location: No.21, Prime Panoramic, Paradeka, Pussallawa, Sri Lanka
-Contact: +94 76 400 1245 | info.royalmationresort@gmail.com
+Contact: +94 76 400 1245 | info.royalmansionresort@gmail.com
     `.trim();
         const adminEmail = env_1.env.ADMIN_NOTIFICATION_EMAIL && !env_1.env.ADMIN_NOTIFICATION_EMAIL.includes("example.test")
             ? env_1.env.ADMIN_NOTIFICATION_EMAIL
             : undefined;
         let guestSent = false;
         let adminSent = false;
-        // Send emails using Nodemailer
-        const transporter = getEmailTransporter();
-        if (transporter) {
-            // 1. Send confirmation to Guest
-            try {
-                await sendMailWithFallback({
-                    from: fromEmail,
-                    to: guestEmailRaw,
-                    subject,
-                    html,
-                    text: plainText,
-                });
-                guestSent = true;
-                console.log(`✅ [email-nodemailer] Booking summary delivered to guest: ${guestEmailRaw} (${booking.reference})`);
-            }
-            catch (guestErr) {
-                logEmailError(`Failed to deliver booking summary to guest (${guestEmailRaw})`, guestErr);
-            }
-            // 2. Send notification to Resort Admin
-            if (adminEmail && adminEmail.toLowerCase() !== guestEmailRaw.toLowerCase()) {
-                try {
-                    const adminHtml = `
-            <div style="background:#f0fdf4;border:1px solid #86efac;padding:12px 16px;margin-bottom:16px;border-radius:6px;font-family:sans-serif;font-size:13px;color:#166534;">
-              <strong>Admin Notification:</strong> A new booking submission was received from <strong>${guestName}</strong> (${guestEmail}, phone: ${guestPhone}).
-            </div>
-            ${html}
-          `;
-                    await sendMailWithFallback({
-                        from: fromEmail,
-                        to: adminEmail,
-                        subject: `[Admin Alert - Guest: ${guestNameRaw}] ${subject}`,
-                        html: adminHtml,
-                        text: `[Admin Alert: New booking from ${guestNameRaw} (${guestEmailRaw})]\n\n${plainText}`,
-                    });
-                    adminSent = true;
-                    console.log(`✅ [email-nodemailer] Booking alert delivered to admin: ${adminEmail} (${booking.reference})`);
-                }
-                catch (adminErr) {
-                    logEmailError(`Failed to deliver booking alert to admin (${adminEmail})`, adminErr);
-                }
+        let usedProvider = "logged";
+        let guestMessageId;
+        let adminMessageId;
+        // 1. Send confirmation to Guest
+        try {
+            const guestResult = await sendEmail({
+                from: fromEmail,
+                to: guestEmailRaw,
+                subject,
+                html,
+                text: plainText,
+            });
+            guestSent = guestResult.sent;
+            if (guestResult.provider)
+                usedProvider = guestResult.provider;
+            guestMessageId = guestResult.messageId;
+            if (guestSent) {
+                console.log(`✅ [email] Booking summary delivered to guest: ${guestEmailRaw} (${booking.reference}) via ${usedProvider}`);
             }
         }
-        else {
-            logEmailError("SMTP not configured", "SMTP is not configured in .env (SMTP_USER, SMTP_PASS, SMTP_HOST/SMTP_SERVICE). Live email dispatch skipped. Email recorded locally.");
+        catch (guestErr) {
+            logEmailError(`Failed to deliver booking summary to guest (${guestEmailRaw})`, guestErr);
+        }
+        // 2. Send notification to Resort Admin
+        if (adminEmail && adminEmail.toLowerCase() !== guestEmailRaw.toLowerCase()) {
+            try {
+                const adminHtml = `
+          <div style="background:#f0fdf4;border:1px solid #86efac;padding:12px 16px;margin-bottom:16px;border-radius:6px;font-family:sans-serif;font-size:13px;color:#166534;">
+            <strong>Admin Notification:</strong> A new booking submission was received from <strong>${guestName}</strong> (${guestEmail}, phone: ${guestPhone}).
+          </div>
+          ${html}
+        `;
+                const adminResult = await sendEmail({
+                    from: fromEmail,
+                    to: adminEmail,
+                    subject: `[Admin Alert - Guest: ${guestNameRaw}] ${subject}`,
+                    html: adminHtml,
+                    text: `[Admin Alert: New booking from ${guestNameRaw} (${guestEmailRaw})]\n\n${plainText}`,
+                });
+                adminSent = adminResult.sent;
+                if (adminResult.provider)
+                    usedProvider = adminResult.provider;
+                adminMessageId = adminResult.messageId;
+                if (adminSent) {
+                    console.log(`✅ [email] Booking alert delivered to admin: ${adminEmail} (${booking.reference}) via ${usedProvider}`);
+                }
+            }
+            catch (adminErr) {
+                logEmailError(`Failed to deliver booking alert to admin (${adminEmail})`, adminErr);
+            }
         }
         // 3. Persist a backup copy in logs/emails/
         try {
@@ -428,7 +500,7 @@ Contact: +94 76 400 1245 | info.royalmationresort@gmail.com
                 fs_1.default.mkdirSync(emailLogDir, { recursive: true });
             const emailFile = path_1.default.join(emailLogDir, `${booking.reference}_${Date.now()}.html`);
             fs_1.default.writeFileSync(emailFile, html, "utf-8");
-            console.log(`📁 [email-nodemailer] Booking summary recorded to ${emailFile}`);
+            console.log(`📁 [email] Booking summary recorded to ${emailFile}`);
         }
         catch {
             // Ignore file log write issues
@@ -446,7 +518,9 @@ Contact: +94 76 400 1245 | info.royalmationresort@gmail.com
                     delivery: guestSent || adminSent ? "SENT" : "LOGGED",
                     guestDelivered: guestSent,
                     adminDelivered: adminSent,
-                    service: "nodemailer",
+                    service: usedProvider,
+                    guestMessageId,
+                    adminMessageId,
                 },
             },
         })
@@ -459,16 +533,83 @@ Contact: +94 76 400 1245 | info.royalmationresort@gmail.com
     }
 }
 /**
- * Perform a live SMTP diagnostic test.
- * Verifies connection, socket handshake, authentication, and optionally sends a test email.
+ * Diagnostic test for active email provider (Resend or SMTP).
+ * Verifies connection and optionally sends a live test message.
  */
 async function testSmtpConnection(targetEmail) {
+    // If RESEND_API_KEY is configured, test Resend
+    const resend = getResendClient();
+    if (resend) {
+        const from = getDefaultFromEmail();
+        const recipient = targetEmail || env_1.env.ADMIN_NOTIFICATION_EMAIL || "delivered@resend.dev";
+        const diag = {
+            provider: "resend",
+            host: "api.resend.com",
+            user: env_1.env.RESEND_API_KEY ? `${env_1.env.RESEND_API_KEY.slice(0, 5)}...` : undefined,
+            verified: true,
+            sent: false,
+        };
+        try {
+            const { data, error } = await resend.emails.send({
+                from,
+                to: [recipient],
+                subject: `[Diagnostic Test] Royal Mansion Resort Villa - Resend ${new Date().toLocaleString()}`,
+                html: `
+          <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;padding:24px;background:#ffffff;border:1px solid #e2e8f0;border-radius:8px;">
+            <h2 style="color:#061b0e;margin-top:0;">✅ Resend Email Delivery Verified</h2>
+            <p style="color:#475569;font-size:15px;line-height:1.6;">
+              This is a live test email from <strong>Royal Mansion Resort Villa</strong> sent via <strong>Resend.com API</strong>.
+              Your transactional email dispatch system is operational!
+            </p>
+            <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:16px;margin:20px 0;font-size:14px;color:#334155;">
+              <div><strong>Provider:</strong> Resend REST API (HTTPS)</div>
+              <div><strong>From Sender:</strong> ${escapeHtml(from)}</div>
+              <div><strong>Delivered To:</strong> ${escapeHtml(recipient)}</div>
+              <div><strong>Server Time:</strong> ${new Date().toISOString()}</div>
+            </div>
+            <p style="color:#94a3b8;font-size:12px;margin:0;">
+              Royal Mansion Resort Villa · Automated Email Diagnostics
+            </p>
+          </div>
+        `,
+                text: `Resend Email Delivery Verified!\nSent to: ${recipient}\nTimestamp: ${new Date().toISOString()}`,
+            });
+            if (error) {
+                const errorMsg = error.message || "Unknown error from Resend API";
+                return {
+                    success: false,
+                    provider: "resend",
+                    message: `Resend dispatch failed: ${errorMsg}`,
+                    diagnostics: { ...diag, error: errorMsg },
+                };
+            }
+            diag.sent = true;
+            diag.messageId = data?.id;
+            return {
+                success: true,
+                provider: "resend",
+                message: `Test email successfully dispatched via Resend to ${recipient}! (Message ID: ${data?.id})`,
+                diagnostics: diag,
+            };
+        }
+        catch (err) {
+            const errMsg = err?.message || String(err);
+            return {
+                success: false,
+                provider: "resend",
+                message: `Resend test threw exception: ${errMsg}`,
+                diagnostics: { ...diag, error: errMsg },
+            };
+        }
+    }
+    // Fallback to testing SMTP
     resetCachedTransporter();
     const host = env_1.env.SMTP_HOST || env_1.env.SMTP_SERVICE || "Not configured";
     const port = env_1.env.SMTP_PORT || (env_1.env.SMTP_SERVICE ? 465 : 587);
     const secure = env_1.env.SMTP_SECURE || port === 465;
     const user = env_1.env.SMTP_USER ? `${env_1.env.SMTP_USER.slice(0, 3)}***` : "Not configured";
     const diag = {
+        provider: "nodemailer",
         host,
         port,
         secure,
@@ -479,10 +620,11 @@ async function testSmtpConnection(targetEmail) {
     };
     const transporter = getEmailTransporter();
     if (!transporter) {
-        const errorMsg = "SMTP credentials missing in .env (SMTP_USER, SMTP_PASS, SMTP_HOST/SMTP_SERVICE).";
+        const errorMsg = "Neither RESEND_API_KEY nor SMTP credentials (SMTP_USER, SMTP_PASS, SMTP_HOST) are configured in .env.";
         logEmailError("testSmtpConnection", errorMsg);
         return {
             success: false,
+            provider: "none",
             message: errorMsg,
             diagnostics: { ...diag, error: errorMsg },
         };
@@ -498,6 +640,7 @@ async function testSmtpConnection(targetEmail) {
         logEmailError("testSmtpConnection verification failed", verifyErr);
         return {
             success: false,
+            provider: "nodemailer",
             message: `SMTP Connection / Auth Failed: ${errText}`,
             diagnostics: { ...diag, error: errText },
         };
@@ -507,6 +650,7 @@ async function testSmtpConnection(targetEmail) {
     if (!recipient) {
         return {
             success: true,
+            provider: "nodemailer",
             message: "SMTP connection & authentication verified successfully! (No recipient specified for test dispatch)",
             diagnostics: diag,
         };
@@ -543,6 +687,7 @@ async function testSmtpConnection(targetEmail) {
         diag.messageId = info.messageId;
         return {
             success: true,
+            provider: "nodemailer",
             message: `Test email successfully dispatched to ${recipient}! (Message ID: ${info.messageId})`,
             diagnostics: diag,
         };
@@ -552,8 +697,10 @@ async function testSmtpConnection(targetEmail) {
         logEmailError(`testSmtpConnection sending to ${recipient}`, sendErr);
         return {
             success: false,
+            provider: "nodemailer",
             message: `Connected successfully, but test email sending failed: ${errText}`,
             diagnostics: { ...diag, error: errText },
         };
     }
 }
+exports.testEmailConnection = testSmtpConnection;
